@@ -3838,12 +3838,10 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 	struct xhci_slot_ctx *slot_ctx;
 	struct xhci_input_control_ctx *ctrl_ctx;
 	u64 temp_64;
-	struct xhci_command *command = NULL;
-
-	mutex_lock(&xhci->mutex);
+	struct xhci_command *command;
 
 	if (xhci->xhc_state)	/* dying, removing or halted */
-		goto out;
+		return -EINVAL;
 
 	if (!udev->slot_id) {
 		xhci_dbg_trace(xhci, trace_xhci_dbg_address,
