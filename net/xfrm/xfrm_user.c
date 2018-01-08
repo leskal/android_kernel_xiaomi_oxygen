@@ -1,6 +1,7 @@
 /* xfrm_user.c: User interface to configure xfrm engine.
  *
  * Copyright (C) 2002 David S. Miller (davem@redhat.com)
+ * Copyright (C) 2017 XiaoMi, Inc.
  *
  * Changes:
  *	Mitsuru KANDA @USAGI

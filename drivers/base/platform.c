@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2002-3 Patrick Mochel
  * Copyright (c) 2002-3 Open Source Development Labs
+ * Copyright (C) 2017 XiaoMi, Inc.
  *
  * This file is released under the GPLv2
  *

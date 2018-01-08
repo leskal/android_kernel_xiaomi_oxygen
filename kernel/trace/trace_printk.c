@@ -2,6 +2,7 @@
  * trace binary printk
  *
  * Copyright (C) 2008 Lai Jiangshan <laijs@cn.fujitsu.com>
+ * Copyright (C) 2017 XiaoMi, Inc.
  *
  */
 #include <linux/seq_file.h>

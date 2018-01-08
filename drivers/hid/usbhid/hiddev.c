@@ -1,6 +1,7 @@
 /*
  *  Copyright (c) 2001 Paul Stewart
  *  Copyright (c) 2001 Vojtech Pavlik
+ *  Copyright (C) 2017 XiaoMi, Inc.
  *
  *  HID char devices, giving access to raw HID device events.
  *

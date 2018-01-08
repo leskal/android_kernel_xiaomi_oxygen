@@ -2,7 +2,7 @@
  * QTI CE 32-bit compatibility syscall for 64-bit systems
  *
  * Copyright (c) 2014-2015, 2017, The Linux Foundation. All rights reserved.
- *
+ * Copyright (C) 2017 XiaoMi, Inc.
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
  * only version 2 as published by the Free Software Foundation.

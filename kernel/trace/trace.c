@@ -10,6 +10,7 @@
  * Based on code from the latency_tracer, that is:
  *  Copyright (C) 2004-2006 Ingo Molnar
  *  Copyright (C) 2004 Nadia Yvette Chambers
+ *  Copyright (C) 2017 XiaoMi, Inc.
  */
 #include <linux/ring_buffer.h>
 #include <generated/utsrelease.h>

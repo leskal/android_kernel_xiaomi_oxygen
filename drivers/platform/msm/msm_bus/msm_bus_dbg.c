@@ -1,4 +1,5 @@
 /* Copyright (c) 2010-2012, 2014-2015, 2017 The Linux Foundation. All rights
+ * Copyright (C) 2017 XiaoMi, Inc.
  * reserved.
  *
  * This program is free software; you can redistribute it and/or modify
