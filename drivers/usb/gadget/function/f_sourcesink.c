@@ -21,7 +21,7 @@
 
 #include "g_zero.h"
 #include "gadget_chips.h"
-#include "u_f.h"
+#include "../u_f.h"
 
 #define USB_MS_TO_SS_INTERVAL(x) USB_MS_TO_HS_INTERVAL(x)
 
