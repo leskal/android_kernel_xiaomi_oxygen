@@ -406,6 +406,9 @@ static void mmc_manage_gp_partitions(struct mmc_card *card, u8 *ext_csd)
 	}
 }
 
+/* Minimum partition switch timeout in milliseconds */
+#define MMC_MIN_PART_SWITCH_TIME	300
+
 /*
  * Decode extended CSD.
  */
@@ -470,6 +473,10 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 
 		/* EXT_CSD value is in units of 10ms, but we store in ms */
 		card->ext_csd.part_time = 10 * ext_csd[EXT_CSD_PART_SWITCH_TIME];
+		/* Some eMMC set the value too low so set a minimum */
+		if (card->ext_csd.part_time &&
+		    card->ext_csd.part_time < MMC_MIN_PART_SWITCH_TIME)
+			card->ext_csd.part_time = MMC_MIN_PART_SWITCH_TIME;
 
 		/* Sleep / awake timeout in 100ns units */
 		if (sa_shift > 0 && sa_shift <= 0x17)
@@ -669,46 +676,14 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 		card->ext_csd.data_sector_size = 512;
 	}
 
+	/* eMMC v5 or later */
 	if (card->ext_csd.rev >= 7) {
-		/* Enhance Strobe is supported since v5.1 which rev should be
-		 * 8 but some eMMC devices can support it with rev 7. So handle
-		 * Enhance Strobe here.
-		 */
-		card->ext_csd.strobe_support = ext_csd[EXT_CSD_STROBE_SUPPORT];
-		card->ext_csd.cmdq_support = ext_csd[EXT_CSD_CMDQ_SUPPORT];
-		card->ext_csd.fw_version = ext_csd[EXT_CSD_FW_VERSION];
-		pr_info("%s: eMMC FW version: 0x%02x\n",
-			mmc_hostname(card->host),
-			card->ext_csd.fw_version);
-		if (card->ext_csd.cmdq_support) {
-			/*
-			 * Queue Depth = N + 1,
-			 * see JEDEC JESD84-B51 section 7.4.19
-			 */
-			card->ext_csd.cmdq_depth =
-				ext_csd[EXT_CSD_CMDQ_DEPTH] + 1;
-			pr_info("%s: CMDQ supported: depth: %d\n",
-				mmc_hostname(card->host),
-				card->ext_csd.cmdq_depth);
-		}
-		card->ext_csd.barrier_support =
-			ext_csd[EXT_CSD_BARRIER_SUPPORT];
-		card->ext_csd.cache_flush_policy =
-			ext_csd[EXT_CSD_CACHE_FLUSH_POLICY];
-		pr_info("%s: cache barrier support %d flush policy %d\n",
-				mmc_hostname(card->host),
-				card->ext_csd.barrier_support,
-				card->ext_csd.cache_flush_policy);
-		card->ext_csd.enhanced_rpmb_supported =
-			(card->ext_csd.rel_param &
-			 EXT_CSD_WR_REL_PARAM_EN_RPMB_REL_WR);
-	} else {
-		card->ext_csd.cmdq_support = 0;
-		card->ext_csd.cmdq_depth = 0;
-		card->ext_csd.barrier_support = 0;
-		card->ext_csd.cache_flush_policy = 0;
+		card->ext_csd.pre_eol_info = ext_csd[EXT_CSD_PRE_EOL_INFO];
+		card->ext_csd.device_life_time_est_typ_a =
+			ext_csd[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_A];
+		card->ext_csd.device_life_time_est_typ_b =
+			ext_csd[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_B];
 	}
-
 out:
 	return err;
 }
@@ -809,6 +784,11 @@ MMC_DEV_ATTR(manfid, "0x%06x\n", card->cid.manfid);
 MMC_DEV_ATTR(name, "%s\n", card->cid.prod_name);
 MMC_DEV_ATTR(oemid, "0x%04x\n", card->cid.oemid);
 MMC_DEV_ATTR(prv, "0x%x\n", card->cid.prv);
+MMC_DEV_ATTR(rev, "0x%x\n", card->ext_csd.rev);
+MMC_DEV_ATTR(pre_eol_info, "%02x\n", card->ext_csd.pre_eol_info);
+MMC_DEV_ATTR(life_time, "0x%02x 0x%02x\n",
+	card->ext_csd.device_life_time_est_typ_a,
+	card->ext_csd.device_life_time_est_typ_b);
 MMC_DEV_ATTR(serial, "0x%08x\n", card->cid.serial);
 MMC_DEV_ATTR(enhanced_area_offset, "%llu\n",
 		card->ext_csd.enhanced_area_offset);
@@ -832,6 +812,9 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_oemid.attr,
 	&dev_attr_prv.attr,
+	&dev_attr_rev.attr,
+	&dev_attr_pre_eol_info.attr,
+	&dev_attr_life_time.attr,
 	&dev_attr_serial.attr,
 	&dev_attr_enhanced_area_offset.attr,
 	&dev_attr_enhanced_area_size.attr,

@@ -39,7 +39,6 @@
 #include <linux/pm_runtime.h>
 #include <linux/ioprio.h>
 
-#define CREATE_TRACE_POINTS
 #include <trace/events/mmc.h>
 
 #include <linux/mmc/ioctl.h>
@@ -329,118 +328,249 @@ out:
 	return ret;
 }
 
-static ssize_t
-num_wr_reqs_to_start_packing_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+
+static int max_read_speed, max_write_speed, cache_size = 4;
+
+module_param(max_read_speed, int, S_IRUSR | S_IRGRP);
+MODULE_PARM_DESC(max_read_speed, "maximum KB/s read speed 0=off");
+module_param(max_write_speed, int, S_IRUSR | S_IRGRP);
+MODULE_PARM_DESC(max_write_speed, "maximum KB/s write speed 0=off");
+module_param(cache_size, int, S_IRUSR | S_IRGRP);
+MODULE_PARM_DESC(cache_size, "MB high speed memory or SLC cache");
+
+/*
+ * helper macros and expectations:
+ *  size    - unsigned long number of bytes
+ *  jiffies - unsigned long HZ timestamp difference
+ *  speed   - unsigned KB/s transfer rate
+ */
+#define size_and_speed_to_jiffies(size, speed) \
+		((size) * HZ / (speed) / 1024UL)
+#define jiffies_and_speed_to_size(jiffies, speed) \
+		(((speed) * (jiffies) * 1024UL) / HZ)
+#define jiffies_and_size_to_speed(jiffies, size) \
+		((size) * HZ / (jiffies) / 1024UL)
+
+/* Limits to report warning */
+/* jiffies_and_size_to_speed(10*HZ, queue_max_hw_sectors(q) * 512UL) ~ 25 */
+#define MIN_SPEED(q) 250 /* 10 times faster than a floppy disk */
+#define MAX_SPEED(q) jiffies_and_size_to_speed(1, queue_max_sectors(q) * 512UL)
+
+#define speed_valid(speed) ((speed) > 0)
+
+static const char off[] = "off\n";
+
+static int max_speed_show(int speed, char *buf)
+{
+	if (speed)
+		return scnprintf(buf, PAGE_SIZE, "%uKB/s\n", speed);
+	else
+		return scnprintf(buf, PAGE_SIZE, off);
+}
+
+static int max_speed_store(const char *buf, struct request_queue *q)
+{
+	unsigned int limit, set = 0;
+
+	if (!strncasecmp(off, buf, sizeof(off) - 2))
+		return set;
+	if (kstrtouint(buf, 0, &set) || (set > INT_MAX))
+		return -EINVAL;
+	if (set == 0)
+		return set;
+	limit = MAX_SPEED(q);
+	if (set > limit)
+		pr_warn("max speed %u ineffective above %u\n", set, limit);
+	limit = MIN_SPEED(q);
+	if (set < limit)
+		pr_warn("max speed %u painful below %u\n", set, limit);
+	return set;
+}
+
+static ssize_t max_write_speed_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
 	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
-	int num_wr_reqs_to_start_packing;
+	int ret = max_speed_show(atomic_read(&md->queue.max_write_speed), buf);
+
+	mmc_blk_put(md);
+	return ret;
+}
+
+static ssize_t max_write_speed_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
+	int set = max_speed_store(buf, md->queue.queue);
+
+	if (set < 0) {
+		mmc_blk_put(md);
+		return set;
+	}
+
+	atomic_set(&md->queue.max_write_speed, set);
+	mmc_blk_put(md);
+	return count;
+}
+
+static const DEVICE_ATTR(max_write_speed, S_IRUGO | S_IWUSR,
+	max_write_speed_show, max_write_speed_store);
+
+static ssize_t max_read_speed_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
+	int ret = max_speed_show(atomic_read(&md->queue.max_read_speed), buf);
+
+	mmc_blk_put(md);
+	return ret;
+}
+
+static ssize_t max_read_speed_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
+	int set = max_speed_store(buf, md->queue.queue);
+
+	if (set < 0) {
+		mmc_blk_put(md);
+		return set;
+	}
+
+	atomic_set(&md->queue.max_read_speed, set);
+	mmc_blk_put(md);
+	return count;
+}
+
+static const DEVICE_ATTR(max_read_speed, S_IRUGO | S_IWUSR,
+	max_read_speed_show, max_read_speed_store);
+
+static ssize_t cache_size_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
+	struct mmc_queue *mq = &md->queue;
+	int cache_size = atomic_read(&mq->cache_size);
 	int ret;
 
-	if (!md)
-		return -EINVAL;
-	num_wr_reqs_to_start_packing = md->queue.num_wr_reqs_to_start_packing;
+	if (!cache_size)
+		ret = scnprintf(buf, PAGE_SIZE, off);
+	else {
+		int speed = atomic_read(&mq->max_write_speed);
 
-	ret = snprintf(buf, PAGE_SIZE, "%d\n", num_wr_reqs_to_start_packing);
+		if (!speed_valid(speed))
+			ret = scnprintf(buf, PAGE_SIZE, "%uMB\n", cache_size);
+		else { /* We accept race between cache_jiffies and cache_used */
+			unsigned long size = jiffies_and_speed_to_size(
+				jiffies - mq->cache_jiffies, speed);
+			long used = atomic_long_read(&mq->cache_used);
+
+			if (size >= used)
+				size = 0;
+			else
+				size = (used - size) * 100 / cache_size
+					/ 1024UL / 1024UL;
+
+			ret = scnprintf(buf, PAGE_SIZE, "%uMB %lu%% used\n",
+				cache_size, size);
+		}
+	}
 
 	mmc_blk_put(md);
 	return ret;
 }
 
-static ssize_t
-num_wr_reqs_to_start_packing_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
+static ssize_t cache_size_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
 {
-	int value;
-	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
-	struct mmc_card *card;
-	int ret = count;
+	struct mmc_blk_data *md;
+	unsigned int set = 0;
 
-	if (!md)
+	if (strncasecmp(off, buf, sizeof(off) - 2)
+	 && (kstrtouint(buf, 0, &set) || (set > INT_MAX)))
 		return -EINVAL;
 
-	card = md->queue.card;
-	if (!card) {
-		ret = -EINVAL;
-		goto exit;
-	}
-
-	sscanf(buf, "%d", &value);
-
-	if (value >= 0) {
-		md->queue.num_wr_reqs_to_start_packing =
-		    min_t(int, value, (int)card->ext_csd.max_packed_writes);
-
-		pr_debug("%s: trigger to pack: new value = %d",
-			mmc_hostname(card->host),
-			md->queue.num_wr_reqs_to_start_packing);
-	} else {
-		pr_err("%s: value %d is not valid. old value remains = %d",
-			mmc_hostname(card->host), value,
-			md->queue.num_wr_reqs_to_start_packing);
-		ret = -EINVAL;
-	}
-
-exit:
+	md = mmc_blk_get(dev_to_disk(dev));
+	atomic_set(&md->queue.cache_size, set);
 	mmc_blk_put(md);
-	return ret;
+	return count;
 }
 
-static ssize_t
-no_pack_for_random_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+static const DEVICE_ATTR(cache_size, S_IRUGO | S_IWUSR,
+	cache_size_show, cache_size_store);
+
+/* correct for write-back */
+static long mmc_blk_cache_used(struct mmc_queue *mq, unsigned long waitfor)
 {
-	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
-	int ret;
+	long used = 0;
+	int speed = atomic_read(&mq->max_write_speed);
 
-	if (!md)
-		return -EINVAL;
-	ret = snprintf(buf, PAGE_SIZE, "%d\n", md->queue.no_pack_for_random);
+	if (speed_valid(speed)) {
+		unsigned long size = jiffies_and_speed_to_size(
+					waitfor - mq->cache_jiffies, speed);
+		used = atomic_long_read(&mq->cache_used);
 
-	mmc_blk_put(md);
-	return ret;
+		if (size >= used)
+			used = 0;
+		else
+			used -= size;
+	}
+
+	atomic_long_set(&mq->cache_used, used);
+	mq->cache_jiffies = waitfor;
+
+	return used;
 }
 
-static ssize_t
-no_pack_for_random_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
+static void mmc_blk_simulate_delay(
+	struct mmc_queue *mq,
+	struct request *req,
+	unsigned long waitfor)
 {
-	int value;
-	struct mmc_blk_data *md = mmc_blk_get(dev_to_disk(dev));
-	struct mmc_card *card;
-	int ret = count;
+	int max_speed;
 
-	if (!md)
-		return -EINVAL;
+	if (!req)
+		return;
 
-	card = md->queue.card;
-	if (!card) {
-		ret = -EINVAL;
-		goto exit;
+	max_speed = (rq_data_dir(req) == READ)
+		? atomic_read(&mq->max_read_speed)
+		: atomic_read(&mq->max_write_speed);
+	if (speed_valid(max_speed)) {
+		unsigned long bytes = blk_rq_bytes(req);
+
+		if (rq_data_dir(req) != READ) {
+			int cache_size = atomic_read(&mq->cache_size);
+
+			if (cache_size) {
+				unsigned long size = cache_size * 1024L * 1024L;
+				long used = mmc_blk_cache_used(mq, waitfor);
+
+				used += bytes;
+				atomic_long_set(&mq->cache_used, used);
+				bytes = 0;
+				if (used > size)
+					bytes = used - size;
+			}
+		}
+		waitfor += size_and_speed_to_jiffies(bytes, max_speed);
+		if (time_is_after_jiffies(waitfor)) {
+			long msecs = jiffies_to_msecs(waitfor - jiffies);
+
+			if (likely(msecs > 0))
+				msleep(msecs);
+		}
 	}
-
-	sscanf(buf, "%d", &value);
-
-	if (value < 0) {
-		pr_err("%s: value %d is not valid. old value remains = %d",
-			mmc_hostname(card->host), value,
-			md->queue.no_pack_for_random);
-		ret = -EINVAL;
-		goto exit;
-	}
-
-	md->queue.no_pack_for_random = (value > 0) ?  true : false;
-
-	pr_debug("%s: no_pack_for_random: new value = %d",
-		mmc_hostname(card->host),
-		md->queue.no_pack_for_random);
-
-exit:
-	mmc_blk_put(md);
-	return ret;
 }
+
+#else
+
+#define mmc_blk_simulate_delay(mq, req, waitfor)
+
+#endif
 
 static int mmc_blk_open(struct block_device *bdev, fmode_t mode)
 {
@@ -1773,7 +1903,23 @@ static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
 		ret = -EIO;
 	}
 
-end_req:
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	else if (atomic_read(&mq->cache_size)) {
+		long used = mmc_blk_cache_used(mq, jiffies);
+
+		if (used) {
+			int speed = atomic_read(&mq->max_write_speed);
+
+			if (speed_valid(speed)) {
+				unsigned long msecs = jiffies_to_msecs(
+					size_and_speed_to_jiffies(
+						used, speed));
+				if (msecs)
+					msleep(msecs);
+			}
+		}
+	}
+#endif
 	blk_end_request_all(req, ret);
 
 	return ret ? 0 : 1;
@@ -2493,7 +2639,7 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_packed *packed = mqrq->packed;
 	bool do_rel_wr, do_data_tag;
-	u32 *packed_cmd_hdr;
+	__le32 *packed_cmd_hdr;
 	u8 hdr_blocks;
 	u8 i = 1;
 
@@ -2505,8 +2651,8 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
 
 	packed_cmd_hdr = packed->cmd_hdr;
 	memset(packed_cmd_hdr, 0, sizeof(packed->cmd_hdr));
-	packed_cmd_hdr[0] = (packed->nr_entries << 16) |
-		(PACKED_CMD_WR << 8) | PACKED_CMD_VER;
+	packed_cmd_hdr[0] = cpu_to_le32((packed->nr_entries << 16) |
+		(PACKED_CMD_WR << 8) | PACKED_CMD_VER);
 	hdr_blocks = mmc_large_sector(card) ? 8 : 1;
 
 	/*
@@ -2520,14 +2666,14 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
 			((brq->data.blocks * brq->data.blksz) >=
 			 card->ext_csd.data_tag_unit_size);
 		/* Argument of CMD23 */
-		packed_cmd_hdr[(i * 2)] =
+		packed_cmd_hdr[(i * 2)] = cpu_to_le32(
 			(do_rel_wr ? MMC_CMD23_ARG_REL_WR : 0) |
 			(do_data_tag ? MMC_CMD23_ARG_TAG_REQ : 0) |
-			blk_rq_sectors(prq);
+			blk_rq_sectors(prq));
 		/* Argument of CMD18 or CMD25 */
-		packed_cmd_hdr[((i * 2)) + 1] =
+		packed_cmd_hdr[((i * 2)) + 1] = cpu_to_le32(
 			mmc_card_blockaddr(card) ?
-			blk_rq_pos(prq) : blk_rq_pos(prq) << 9;
+			blk_rq_pos(prq) : blk_rq_pos(prq) << 9);
 		packed->blocks += blk_rq_sectors(prq);
 		i++;
 	}
@@ -3261,6 +3407,9 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 	struct mmc_async_req *areq;
 	const u8 packed_nr = 2;
 	u8 reqs = 0;
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	unsigned long waitfor = jiffies;
+#endif
 
 	if (!rqc && !mq->mqrq_prev->req)
 		return 0;
@@ -3310,6 +3459,8 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			 * A block was successfully transferred.
 			 */
 			mmc_blk_reset_success(md, type);
+
+			mmc_blk_simulate_delay(mq, rqc, waitfor);
 
 			if (mmc_packed_cmd(mq_rq->cmd_type)) {
 				ret = mmc_blk_end_packed_req(mq_rq);
@@ -3889,6 +4040,14 @@ static void mmc_blk_remove_req(struct mmc_blk_data *md)
 					card->ext_csd.boot_ro_lockable)
 				device_remove_file(disk_to_dev(md->disk),
 					&md->power_ro_lock);
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_max_write_speed);
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_max_read_speed);
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_cache_size);
+#endif
 
 			del_gendisk(md->disk);
 		}
@@ -3924,6 +4083,24 @@ static int mmc_add_disk(struct mmc_blk_data *md)
 	ret = device_create_file(disk_to_dev(md->disk), &md->force_ro);
 	if (ret)
 		goto force_ro_fail;
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	atomic_set(&md->queue.max_write_speed, max_write_speed);
+	ret = device_create_file(disk_to_dev(md->disk),
+			&dev_attr_max_write_speed);
+	if (ret)
+		goto max_write_speed_fail;
+	atomic_set(&md->queue.max_read_speed, max_read_speed);
+	ret = device_create_file(disk_to_dev(md->disk),
+			&dev_attr_max_read_speed);
+	if (ret)
+		goto max_read_speed_fail;
+	atomic_set(&md->queue.cache_size, cache_size);
+	atomic_long_set(&md->queue.cache_used, 0);
+	md->queue.cache_jiffies = jiffies;
+	ret = device_create_file(disk_to_dev(md->disk), &dev_attr_cache_size);
+	if (ret)
+		goto cache_size_fail;
+#endif
 
 	if ((md->area_type & MMC_BLK_DATA_AREA_BOOT) &&
 	     card->ext_csd.boot_ro_lockable) {
@@ -3977,6 +4154,14 @@ no_pack_for_random_fails:
 num_wr_reqs_to_start_packing_fail:
 	device_remove_file(disk_to_dev(md->disk), &md->power_ro_lock);
 power_ro_lock_fail:
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	device_remove_file(disk_to_dev(md->disk), &dev_attr_cache_size);
+cache_size_fail:
+	device_remove_file(disk_to_dev(md->disk), &dev_attr_max_read_speed);
+max_read_speed_fail:
+	device_remove_file(disk_to_dev(md->disk), &dev_attr_max_write_speed);
+max_write_speed_fail:
+#endif
 	device_remove_file(disk_to_dev(md->disk), &md->force_ro);
 force_ro_fail:
 	del_gendisk(md->disk);
@@ -4015,10 +4200,11 @@ static const struct mmc_fixup blk_fixups[] =
 		  add_quirk_mmc, MMC_QUIRK_CMDQ_EMPTY_BEFORE_DCMD),
 
 	/*
-	 * Some Micron MMC cards needs longer data read timeout than
-	 * indicated in CSD.
+	 * Some MMC cards need longer data read timeout than indicated in CSD.
 	 */
 	MMC_FIXUP(CID_NAME_ANY, CID_MANFID_MICRON, 0x200, add_quirk_mmc,
+		  MMC_QUIRK_LONG_READ_TIME),
+	MMC_FIXUP("008GE0", CID_MANFID_TOSHIBA, CID_OEMID_ANY, add_quirk_mmc,
 		  MMC_QUIRK_LONG_READ_TIME),
 
 	/*

@@ -107,24 +107,10 @@ struct mmc_request {
 	struct completion	completion;
 	void			(*done)(struct mmc_request *);/* completion function */
 	struct mmc_host		*host;
-	struct mmc_cmdq_req	*cmdq_req;
-	struct request *req;
-};
-
-struct mmc_bus_ops {
-	void (*remove)(struct mmc_host *);
-	void (*detect)(struct mmc_host *);
-	int (*pre_suspend)(struct mmc_host *);
-	int (*suspend)(struct mmc_host *);
-	int (*resume)(struct mmc_host *);
-	int (*runtime_suspend)(struct mmc_host *);
-	int (*runtime_resume)(struct mmc_host *);
-	int (*runtime_idle)(struct mmc_host *);
-	int (*power_save)(struct mmc_host *);
-	int (*power_restore)(struct mmc_host *);
-	int (*alive)(struct mmc_host *);
-	int (*shutdown)(struct mmc_host *);
-	int (*change_bus_speed)(struct mmc_host *, unsigned long *);
+#ifdef CONFIG_BLOCK
+	ktime_t			io_start;
+	int			lat_hist_enabled;
+#endif
 };
 
 struct mmc_card;

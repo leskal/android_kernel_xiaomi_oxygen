@@ -362,7 +362,9 @@ static int f_midi_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 	/* allocate a bunch of read buffers and queue them all at once. */
 	for (i = 0; i < midi->qlen && err == 0; i++) {
 		struct usb_request *req =
-			midi_alloc_ep_req(midi->out_ep, midi->buflen);
+			midi_alloc_ep_req(midi->out_ep,
+				max_t(unsigned, midi->buflen,
+					bulk_out_desc.wMaxPacketSize));
 		if (req == NULL)
 			return -ENOMEM;
 
@@ -909,24 +911,279 @@ fail:
 	return status;
 }
 
-/**
- * f_midi_bind_config - add USB MIDI function to a configuration
- * @c: the configuration to supcard the USB audio function
- * @index: the soundcard index to use for the ALSA device creation
- * @id: the soundcard id to use for the ALSA device creation
- * @buflen: the buffer length to use
- * @qlen the number of read requests to pre-allocate
- * Context: single threaded during gadget setup
- *
- * Returns zero on success, else negative errno.
- */
-int /* __init */ f_midi_bind_config(struct usb_configuration *c,
-			      int index, char *id,
-			      unsigned int in_ports,
-			      unsigned int out_ports,
-			      unsigned int buflen,
-			      unsigned int qlen,
-			      struct midi_alsa_config *config)
+static inline struct f_midi_opts *to_f_midi_opts(struct config_item *item)
+{
+	return container_of(to_config_group(item), struct f_midi_opts,
+			    func_inst.group);
+}
+
+CONFIGFS_ATTR_STRUCT(f_midi_opts);
+CONFIGFS_ATTR_OPS(f_midi_opts);
+
+static void midi_attr_release(struct config_item *item)
+{
+	struct f_midi_opts *opts = to_f_midi_opts(item);
+
+	usb_put_function_instance(&opts->func_inst);
+}
+
+static struct configfs_item_operations midi_item_ops = {
+	.release	= midi_attr_release,
+	.show_attribute	= f_midi_opts_attr_show,
+	.store_attribute = f_midi_opts_attr_store,
+};
+
+#define F_MIDI_OPT(name, test_limit, limit)				\
+static ssize_t f_midi_opts_##name##_show(struct f_midi_opts *opts, char *page) \
+{									\
+	int result;							\
+									\
+	mutex_lock(&opts->lock);					\
+	result = sprintf(page, "%d\n", opts->name);			\
+	mutex_unlock(&opts->lock);					\
+									\
+	return result;							\
+}									\
+									\
+static ssize_t f_midi_opts_##name##_store(struct f_midi_opts *opts,	\
+					 const char *page, size_t len)	\
+{									\
+	int ret;							\
+	u32 num;							\
+									\
+	mutex_lock(&opts->lock);					\
+	if (opts->refcnt) {						\
+		ret = -EBUSY;						\
+		goto end;						\
+	}								\
+									\
+	ret = kstrtou32(page, 0, &num);					\
+	if (ret)							\
+		goto end;						\
+									\
+	if (test_limit && num > limit) {				\
+		ret = -EINVAL;						\
+		goto end;						\
+	}								\
+	opts->name = num;						\
+	ret = len;							\
+									\
+end:									\
+	mutex_unlock(&opts->lock);					\
+	return ret;							\
+}									\
+									\
+static struct f_midi_opts_attribute f_midi_opts_##name =		\
+	__CONFIGFS_ATTR(name, S_IRUGO | S_IWUSR, f_midi_opts_##name##_show, \
+			f_midi_opts_##name##_store)
+
+F_MIDI_OPT(index, true, SNDRV_CARDS);
+F_MIDI_OPT(buflen, false, 0);
+F_MIDI_OPT(qlen, false, 0);
+F_MIDI_OPT(in_ports, true, MAX_PORTS);
+F_MIDI_OPT(out_ports, true, MAX_PORTS);
+
+static ssize_t f_midi_opts_id_show(struct f_midi_opts *opts, char *page)
+{
+	int result;
+
+	mutex_lock(&opts->lock);
+	if (opts->id) {
+		result = strlcpy(page, opts->id, PAGE_SIZE);
+	} else {
+		page[0] = 0;
+		result = 0;
+	}
+
+	mutex_unlock(&opts->lock);
+
+	return result;
+}
+
+static ssize_t f_midi_opts_id_store(struct f_midi_opts *opts,
+				    const char *page, size_t len)
+{
+	int ret;
+	char *c;
+
+	mutex_lock(&opts->lock);
+	if (opts->refcnt) {
+		ret = -EBUSY;
+		goto end;
+	}
+
+	c = kstrndup(page, len, GFP_KERNEL);
+	if (!c) {
+		ret = -ENOMEM;
+		goto end;
+	}
+	if (opts->id_allocated)
+		kfree(opts->id);
+	opts->id = c;
+	opts->id_allocated = true;
+	ret = len;
+end:
+	mutex_unlock(&opts->lock);
+	return ret;
+}
+
+static struct f_midi_opts_attribute f_midi_opts_id =
+	__CONFIGFS_ATTR(id, S_IRUGO | S_IWUSR, f_midi_opts_id_show,
+			f_midi_opts_id_store);
+
+static struct configfs_attribute *midi_attrs[] = {
+	&f_midi_opts_index.attr,
+	&f_midi_opts_buflen.attr,
+	&f_midi_opts_qlen.attr,
+	&f_midi_opts_in_ports.attr,
+	&f_midi_opts_out_ports.attr,
+	&f_midi_opts_id.attr,
+	NULL,
+};
+
+static struct config_item_type midi_func_type = {
+	.ct_item_ops	= &midi_item_ops,
+	.ct_attrs	= midi_attrs,
+	.ct_owner	= THIS_MODULE,
+};
+
+static void f_midi_free_inst(struct usb_function_instance *f)
+{
+	struct f_midi_opts *opts;
+
+	opts = container_of(f, struct f_midi_opts, func_inst);
+
+	if (opts->id_allocated)
+		kfree(opts->id);
+
+	kfree(opts);
+}
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+extern struct device *create_function_device(char *name);
+static ssize_t alsa_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct usb_function_instance *fi_midi = dev_get_drvdata(dev);
+	struct f_midi *midi;
+
+	if (!fi_midi->f)
+		dev_warn(dev, "f_midi: function not set\n");
+
+	if (fi_midi && fi_midi->f) {
+		midi = func_to_midi(fi_midi->f);
+		if (midi->rmidi && midi->rmidi->card)
+			return sprintf(buf, "%d %d\n",
+			midi->rmidi->card->number, midi->rmidi->device);
+	}
+
+	/* print PCM card and device numbers */
+	return sprintf(buf, "%d %d\n", -1, -1);
+}
+
+static DEVICE_ATTR(alsa, S_IRUGO, alsa_show, NULL);
+
+static struct device_attribute *alsa_function_attributes[] = {
+	&dev_attr_alsa,
+	NULL
+};
+
+static int create_alsa_device(struct usb_function_instance *fi)
+{
+	struct device *dev;
+	struct device_attribute **attrs;
+	struct device_attribute *attr;
+	int err = 0;
+
+	dev = create_function_device("f_midi");
+	if (IS_ERR(dev))
+		return PTR_ERR(dev);
+
+	attrs = alsa_function_attributes;
+	if (attrs) {
+		while ((attr = *attrs++) && !err)
+			err = device_create_file(dev, attr);
+		if (err) {
+			device_destroy(dev->class, dev->devt);
+			return -EINVAL;
+		}
+	}
+	dev_set_drvdata(dev, fi);
+	return 0;
+}
+#else
+static int create_alsa_device(struct usb_function_instance *fi)
+{
+	return 0;
+}
+#endif
+
+static struct usb_function_instance *f_midi_alloc_inst(void)
+{
+	struct f_midi_opts *opts;
+
+	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
+	if (!opts)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_init(&opts->lock);
+	opts->func_inst.free_func_inst = f_midi_free_inst;
+	opts->index = SNDRV_DEFAULT_IDX1;
+	opts->id = SNDRV_DEFAULT_STR1;
+	opts->buflen = 256;
+	opts->qlen = 32;
+	opts->in_ports = 1;
+	opts->out_ports = 1;
+
+	if (create_alsa_device(&opts->func_inst)) {
+		kfree(opts);
+		return ERR_PTR(-ENODEV);
+	}
+
+	config_group_init_type_name(&opts->func_inst.group, "",
+				    &midi_func_type);
+
+	return &opts->func_inst;
+}
+
+static void f_midi_free(struct usb_function *f)
+{
+	struct f_midi *midi;
+	struct f_midi_opts *opts;
+	int i;
+
+	midi = func_to_midi(f);
+	opts = container_of(f->fi, struct f_midi_opts, func_inst);
+	kfree(midi->id);
+	mutex_lock(&opts->lock);
+	for (i = opts->in_ports - 1; i >= 0; --i)
+		kfree(midi->in_port[i]);
+	kfree(midi);
+	opts->func_inst.f = NULL;
+	--opts->refcnt;
+	mutex_unlock(&opts->lock);
+}
+
+static void f_midi_unbind(struct usb_configuration *c, struct usb_function *f)
+{
+	struct usb_composite_dev *cdev = f->config->cdev;
+	struct f_midi *midi = func_to_midi(f);
+	struct snd_card *card;
+
+	DBG(cdev, "unbind\n");
+
+	/* just to be sure */
+	f_midi_disable(f);
+
+	card = midi->card;
+	midi->card = NULL;
+	if (card)
+		snd_card_free(card);
+
+	usb_free_all_descriptors(f);
+}
+
+static struct usb_function *f_midi_alloc(struct usb_function_instance *fi)
 {
 	struct f_midi *midi;
 	int status, i;

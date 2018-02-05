@@ -16,6 +16,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 
 #include <linux/mmc/card.h>
@@ -380,12 +381,8 @@ int mmc_add_card(struct mmc_card *card)
 #endif
 	mmc_init_context_info(card->host);
 
-	if (mmc_card_sdio(card)) {
-		ret = device_init_wakeup(&card->dev, true);
-		if (ret)
-			pr_err("%s: %s: failed to init wakeup: %d\n",
-			       mmc_hostname(card->host), __func__, ret);
-	}
+	card->dev.of_node = mmc_of_find_child_device(card->host, 0);
+
 	ret = device_add(&card->dev);
 	if (ret)
 		return ret;
@@ -414,6 +411,7 @@ void mmc_remove_card(struct mmc_card *card)
 				mmc_hostname(card->host), card->rca);
 		}
 		device_del(&card->dev);
+		of_node_put(card->dev.of_node);
 	}
 
 	kfree(card->wr_pack_stats.packing_events);

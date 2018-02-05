@@ -879,15 +879,9 @@ struct ufs_hba {
 	struct ufs_clk_scaling clk_scaling;
 	bool is_sys_suspended;
 
-	enum bkops_status urgent_bkops_lvl;
-	bool is_urgent_bkops_lvl_checked;
-
-	struct rw_semaphore clk_scaling_lock;
-
-	/* If set, don't gate device ref_clk during clock gating */
-	bool no_ref_clk_gating;
-
-	int scsi_block_reqs_cnt;
+	int			latency_hist_enabled;
+	struct io_latency_state io_lat_read;
+	struct io_latency_state io_lat_write;
 };
 
 /* Returns true if clocks can be gated. Otherwise false */

@@ -173,9 +173,7 @@ static struct srcu_struct pmus_srcu;
  *   2 - disallow kernel profiling for unpriv
  *   3 - disallow all unpriv perf event use
  */
-#ifdef CONFIG_PERF_EVENTS_USERMODE
-int sysctl_perf_event_paranoid __read_mostly = -1;
-#elif defined CONFIG_SECURITY_PERF_EVENTS_RESTRICT
+#ifdef CONFIG_SECURITY_PERF_EVENTS_RESTRICT
 int sysctl_perf_event_paranoid __read_mostly = 3;
 #else
 int sysctl_perf_event_paranoid __read_mostly = 1;
@@ -6077,6 +6075,8 @@ end:
 	rcu_read_unlock();
 }
 
+DEFINE_PER_CPU(struct pt_regs, __perf_regs[4]);
+
 int perf_swevent_get_recursion_context(void)
 {
 	struct swevent_htable *swhash = this_cpu_ptr(&swevent_htable);
@@ -6092,21 +6092,30 @@ inline void perf_swevent_put_recursion_context(int rctx)
 	put_recursion_context(swhash->recursion, rctx);
 }
 
-void __perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
+void ___perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
 {
 	struct perf_sample_data data;
+
+	if (WARN_ON_ONCE(!regs))
+		return;
+
+	perf_sample_data_init(&data, addr, 0);
+	do_perf_sw_event(PERF_TYPE_SOFTWARE, event_id, nr, &data, regs);
+}
+
+void __perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
+{
 	int rctx;
 
 	preempt_disable_notrace();
 	rctx = perf_swevent_get_recursion_context();
-	if (rctx < 0)
-		return;
+	if (unlikely(rctx < 0))
+		goto fail;
 
-	perf_sample_data_init(&data, addr, 0);
-
-	do_perf_sw_event(PERF_TYPE_SOFTWARE, event_id, nr, &data, regs);
+	___perf_sw_event(event_id, nr, regs, addr);
 
 	perf_swevent_put_recursion_context(rctx);
+fail:
 	preempt_enable_notrace();
 }
 
@@ -7435,6 +7444,37 @@ static void mutex_lock_double(struct mutex *a, struct mutex *b)
 	mutex_lock_nested(b, SINGLE_DEPTH_NESTING);
 }
 
+/*
+ * Variation on perf_event_ctx_lock_nested(), except we take two context
+ * mutexes.
+ */
+static struct perf_event_context *
+__perf_event_ctx_lock_double(struct perf_event *group_leader,
+			     struct perf_event_context *ctx)
+{
+	struct perf_event_context *gctx;
+
+again:
+	rcu_read_lock();
+	gctx = ACCESS_ONCE(group_leader->ctx);
+	if (!atomic_inc_not_zero(&gctx->refcount)) {
+		rcu_read_unlock();
+		goto again;
+	}
+	rcu_read_unlock();
+
+	mutex_lock_double(&gctx->mutex, &ctx->mutex);
+
+	if (group_leader->ctx != gctx) {
+		mutex_unlock(&ctx->mutex);
+		mutex_unlock(&gctx->mutex);
+		put_ctx(gctx);
+		goto again;
+	}
+
+	return gctx;
+}
+
 /**
  * sys_perf_event_open - open a performance event, associate it to a task/cpu
  *
@@ -7620,28 +7660,27 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (group_leader->group_leader != group_leader)
 			goto err_context;
 		/*
-		 * Do not allow to attach to a group in a different
-		 * task or CPU context:
+		 * Make sure we're both events for the same CPU;
+		 * grouping events for different CPUs is broken; since
+		 * you can never concurrently schedule them anyhow.
 		 */
-		if (move_group) {
-			/*
-			 * Make sure we're both on the same task, or both
-			 * per-cpu events.
-			 */
-			if (group_leader->ctx->task != ctx->task)
-				goto err_context;
+		if (group_leader->cpu != event->cpu)
+			goto err_context;
 
-			/*
-			 * Make sure we're both events for the same CPU;
-			 * grouping events for different CPUs is broken; since
-			 * you can never concurrently schedule them anyhow.
-			 */
-			if (group_leader->cpu != event->cpu)
-				goto err_context;
-		} else {
-			if (group_leader->ctx != ctx)
-				goto err_context;
-		}
+		/*
+		 * Make sure we're both on the same task, or both
+		 * per-CPU events.
+		 */
+		if (group_leader->ctx->task != ctx->task)
+			goto err_context;
+
+		/*
+		 * Do not allow to attach to a group in a different task
+		 * or CPU context. If we're moving SW events, we'll fix
+		 * this up later, so allow that.
+		 */
+		if (!move_group && group_leader->ctx != ctx)
+			goto err_context;
 
 		/*
 		 * Only a group leader can be exclusive or pinned
@@ -7664,14 +7703,31 @@ SYSCALL_DEFINE5(perf_event_open,
 	}
 
 	if (move_group) {
-		gctx = group_leader->ctx;
+		gctx = __perf_event_ctx_lock_double(group_leader, ctx);
+
+		/*
+		 * Check if we raced against another sys_perf_event_open() call
+		 * moving the software group underneath us.
+		 */
+		if (!(group_leader->group_flags & PERF_GROUP_SOFTWARE)) {
+			/*
+			 * If someone moved the group out from under us, check
+			 * if this new event wound up on the same ctx, if so
+			 * its the regular !move_group case, otherwise fail.
+			 */
+			if (gctx != ctx) {
+				err = -EINVAL;
+				goto err_locked;
+			} else {
+				perf_event_ctx_unlock(group_leader, gctx);
+				move_group = 0;
+			}
+		}
 
 		/*
 		 * See perf_event_ctx_lock() for comments on the details
 		 * of swizzling perf_event::ctx.
 		 */
-		mutex_lock_double(&gctx->mutex, &ctx->mutex);
-
 		perf_remove_from_context(group_leader, false);
 
 		/*
@@ -7712,7 +7768,7 @@ SYSCALL_DEFINE5(perf_event_open,
 	perf_unpin_context(ctx);
 
 	if (move_group) {
-		mutex_unlock(&gctx->mutex);
+		perf_event_ctx_unlock(group_leader, gctx);
 		put_ctx(gctx);
 	}
 	mutex_unlock(&ctx->mutex);
@@ -7743,6 +7799,11 @@ SYSCALL_DEFINE5(perf_event_open,
 	fd_install(event_fd, event_file);
 	return event_fd;
 
+err_locked:
+	if (move_group)
+		perf_event_ctx_unlock(group_leader, gctx);
+	mutex_unlock(&ctx->mutex);
+	fput(event_file);
 err_context:
 	perf_unpin_context(ctx);
 	put_ctx(ctx);
@@ -8281,7 +8342,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
 		ret = inherit_task_group(event, parent, parent_ctx,
 					 child, ctxn, &inherited_all);
 		if (ret)
-			break;
+			goto out_unlock;
 	}
 
 	/*
@@ -8297,7 +8358,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
 		ret = inherit_task_group(event, parent, parent_ctx,
 					 child, ctxn, &inherited_all);
 		if (ret)
-			break;
+			goto out_unlock;
 	}
 
 	raw_spin_lock_irqsave(&parent_ctx->lock, flags);
@@ -8325,6 +8386,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
 	}
 
 	raw_spin_unlock_irqrestore(&parent_ctx->lock, flags);
+out_unlock:
 	mutex_unlock(&parent_ctx->mutex);
 
 	perf_unpin_context(parent_ctx);
@@ -8447,29 +8509,6 @@ static void perf_event_exit_cpu_context(int cpu)
 }
 
 static void perf_event_start_swclock(int cpu)
-{
-	struct perf_event_context *ctx;
-	struct pmu *pmu;
-	int idx;
-	struct perf_event *event, *tmp;
-
-	idx = srcu_read_lock(&pmus_srcu);
-	list_for_each_entry_rcu(pmu, &pmus, entry) {
-		if (pmu->events_across_hotplug) {
-			ctx = &per_cpu_ptr(pmu->pmu_cpu_context, cpu)->ctx;
-			list_for_each_entry_safe(event, tmp, &ctx->event_list,
-						 event_entry) {
-				if (event->attr.config ==
-				    PERF_COUNT_SW_CPU_CLOCK &&
-				    event->attr.type == PERF_TYPE_SOFTWARE)
-					cpu_clock_event_start(event, 0);
-			}
-		}
-	}
-	srcu_read_unlock(&pmus_srcu, idx);
-}
-
-static void perf_event_exit_cpu(int cpu)
 {
 	perf_event_exit_cpu_context(cpu);
 }

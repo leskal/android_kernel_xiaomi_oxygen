@@ -24,7 +24,7 @@ enum mmc_packed_type {
 
 struct mmc_packed {
 	struct list_head	list;
-	u32			cmd_hdr[1024];
+	__le32			cmd_hdr[1024];
 	unsigned int		blocks;
 	u8			nr_entries;
 	u8			retries;
@@ -63,19 +63,14 @@ struct mmc_queue {
 	struct mmc_queue_req	mqrq[2];
 	struct mmc_queue_req	*mqrq_cur;
 	struct mmc_queue_req	*mqrq_prev;
-	struct mmc_queue_req	*mqrq_cmdq;
-	bool			wr_packing_enabled;
-	int			num_of_potential_packed_wr_reqs;
-	int			num_wr_reqs_to_start_packing;
-	bool			no_pack_for_random;
-	struct work_struct	cmdq_err_work;
-
-	struct completion	cmdq_pending_req_done;
-	struct completion	cmdq_shutdown_complete;
-	struct request		*cmdq_req_peeked;
-	int (*err_check_fn) (struct mmc_card *, struct mmc_async_req *);
-	void (*packed_test_fn) (struct request_queue *, struct mmc_queue_req *);
-	void (*cmdq_shutdown)(struct mmc_queue *);
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	atomic_t max_write_speed;
+	atomic_t max_read_speed;
+	atomic_t cache_size;
+	/* i/o tracking */
+	atomic_long_t cache_used;
+	unsigned long cache_jiffies;
+#endif
 };
 
 extern int mmc_init_queue(struct mmc_queue *, struct mmc_card *, spinlock_t *,
